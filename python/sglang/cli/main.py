@@ -24,6 +24,11 @@ def main():
         help="Run inference on a multimodal model.",
         add_help=False,
     )
+    subparsers.add_parser(
+        "run-batch",
+        help="Run offline batch inference from a JSONL file.",
+        add_help=False,
+    )
 
     # simple commands
     version_parser = subparsers.add_parser(
@@ -42,5 +47,9 @@ def main():
         from sglang.cli.generate import generate
 
         generate(args, extra_argv)
+    elif args.subcommand == "run-batch":
+        from sglang.cli.run_batch import run_batch
+
+        run_batch(args, extra_argv)
     elif args.subcommand == "version":
         version(args, extra_argv)
