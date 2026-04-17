@@ -342,6 +342,12 @@ class ServerArgs:
     max_running_requests: Optional[int] = None
     max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
+    disable_activation_aware_running_token_budget: bool = False
+    activation_aware_avg_tokens_per_request: int = 512
+    activation_aware_system_reserve_gb: float = 3.0
+    activation_aware_attention_factor: float = 4.0
+    activation_aware_graph_capture_token_factor: float = 1.0
+    activation_aware_safety_factor: float = 1.0
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
     max_prefill_tokens: int = 16384
@@ -3911,6 +3917,41 @@ class ServerArgs:
             help="The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. "
             "This option is typically used for development and debugging purposes."
             + f"\n\n{human_readable_int.__doc__}",
+        )
+        parser.add_argument(
+            "--disable-activation-aware-running-token-budget",
+            action="store_true",
+            help="Disable the activation-aware running token budget that caps auto-derived max-running-requests using the non-static memory headroom.",
+        )
+        parser.add_argument(
+            "--activation-aware-avg-tokens-per-request",
+            type=int,
+            default=ServerArgs.activation_aware_avg_tokens_per_request,
+            help="Average running tokens per request used when converting the activation-aware running token budget into max-running-requests.",
+        )
+        parser.add_argument(
+            "--activation-aware-system-reserve-gb",
+            type=float,
+            default=ServerArgs.activation_aware_system_reserve_gb,
+            help="Extra per-rank system reserve, in GiB, kept out of the activation-aware running token budget.",
+        )
+        parser.add_argument(
+            "--activation-aware-attention-factor",
+            type=float,
+            default=ServerArgs.activation_aware_attention_factor,
+            help="Per-token attention activation multiplier, relative to hidden_size, used by the activation-aware running token budget.",
+        )
+        parser.add_argument(
+            "--activation-aware-graph-capture-token-factor",
+            type=float,
+            default=ServerArgs.activation_aware_graph_capture_token_factor,
+            help="Multiplier applied when reserving activation-aware memory for cuda-graph and piecewise-cuda-graph capture shapes.",
+        )
+        parser.add_argument(
+            "--activation-aware-safety-factor",
+            type=float,
+            default=ServerArgs.activation_aware_safety_factor,
+            help="Safety multiplier applied to the estimated per-token activation bytes.",
         )
         parser.add_argument(
             "--chunked-prefill-size",

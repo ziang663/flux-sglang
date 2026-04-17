@@ -10,6 +10,11 @@ from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.model_executor.activation_budget import (
+    ActivationBudgetConfig,
+    ActivationBudgetResult,
+    estimate_activation_budget,
+)
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -48,6 +53,7 @@ class MemoryPoolConfig:
     max_running_requests: int
     full_max_total_num_tokens: Optional[int] = None
     swa_max_total_num_tokens: Optional[int] = None
+    activation_limited_max_running_tokens: Optional[int] = None
 
     mem_fraction_static: Optional[float] = None
 
@@ -846,12 +852,73 @@ class ModelRunnerKVCacheMixin:
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
             )
 
+        activation_budget = self._estimate_activation_budget()
+        self.activation_budget = activation_budget
+        if activation_budget is not None:
+            logger.info(
+                "Activation-aware running budget: "
+                f"max_running_tokens={activation_budget.max_running_tokens}, "
+                f"max_running_requests={activation_budget.max_running_requests}, "
+                f"activation_per_token={activation_budget.activation_bytes_per_token / (1 << 20):.2f} MiB, "
+                f"dynamic_headroom={(activation_budget.dynamic_headroom_bytes / (1 << 30)):.2f} GiB, "
+                f"system_reserve={(activation_budget.system_reserve_bytes / (1 << 30)):.2f} GiB, "
+                f"graph_reserve={(activation_budget.graph_reserve_bytes / (1 << 30)):.2f} GiB"
+            )
+
         return max_num_reqs
+
+    def _estimate_activation_budget(
+        self: ModelRunner,
+    ) -> Optional[ActivationBudgetResult]:
+        if self.server_args.disable_activation_aware_running_token_budget:
+            return None
+
+        config = ActivationBudgetConfig(
+            total_gpu_memory_gb=self.total_gpu_memory,
+            mem_fraction_static=self.mem_fraction_static,
+            hidden_size=self.model_config.hidden_size,
+            activation_dtype_size=torch._utils._element_size(self.model_config.dtype),
+            chunked_prefill_size=max(self.server_args.chunked_prefill_size or 0, 0),
+            max_prefill_tokens=max(self.server_args.max_prefill_tokens or 0, 0),
+            cuda_graph_max_bs=max(self.server_args.cuda_graph_max_bs or 0, 0),
+            disable_cuda_graph=self.server_args.disable_cuda_graph,
+            piecewise_cuda_graph_max_tokens=max(
+                self.server_args.piecewise_cuda_graph_max_tokens or 0, 0
+            ),
+            disable_piecewise_cuda_graph=self.server_args.disable_piecewise_cuda_graph,
+            tp_size=max(self.tp_size, 1),
+            ep_size=max(self.server_args.ep_size, 1),
+            moe_dp_size=max(self.server_args.moe_dp_size, 1),
+            intermediate_size=getattr(
+                self.model_config.hf_text_config, "intermediate_size", None
+            ),
+            moe_intermediate_size=getattr(
+                self.model_config.hf_text_config, "moe_intermediate_size", None
+            ),
+            num_experts_per_tok=getattr(
+                self.model_config.hf_text_config, "num_experts_per_tok", None
+            ),
+            avg_tokens_per_request=(
+                self.server_args.activation_aware_avg_tokens_per_request
+            ),
+            attention_activation_factor=(
+                self.server_args.activation_aware_attention_factor
+            ),
+            graph_capture_token_factor=(
+                self.server_args.activation_aware_graph_capture_token_factor
+            ),
+            safety_factor=self.server_args.activation_aware_safety_factor,
+            system_reserve_gb=self.server_args.activation_aware_system_reserve_gb,
+        )
+        return estimate_activation_budget(config)
 
     def _apply_memory_pool_config(self: ModelRunner, config: MemoryPoolConfig):
         """Apply a resolved MemoryPoolConfig and initialize pools."""
         self.max_total_num_tokens = config.max_total_num_tokens
         self.max_running_requests = config.max_running_requests
+        self.activation_limited_max_running_tokens = (
+            config.activation_limited_max_running_tokens
+        )
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = config.full_max_total_num_tokens
             self.swa_max_total_num_tokens = config.swa_max_total_num_tokens
@@ -877,6 +944,11 @@ class ModelRunnerKVCacheMixin:
             max_running_requests=self._resolve_max_num_reqs(token_capacity),
             full_max_total_num_tokens=full_tokens,
             swa_max_total_num_tokens=swa_tokens,
+            activation_limited_max_running_tokens=(
+                self.activation_budget.max_running_tokens
+                if getattr(self, "activation_budget", None) is not None
+                else None
+            ),
             mem_fraction_static=self.server_args.mem_fraction_static,
         )
 

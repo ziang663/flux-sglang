@@ -415,6 +415,7 @@ class TpModelWorker(BaseTpWorker):
             self.max_total_num_tokens,
             self.max_prefill_tokens,
             self.max_running_requests,
+            self.model_runner.activation_limited_max_running_tokens,
             self.max_queued_requests,
             self.max_req_len,
             self.max_req_input_len,
