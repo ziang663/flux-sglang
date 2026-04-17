@@ -1897,6 +1897,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
+    def check_decode_running_tokens(
+        self,
+        max_running_tokens: Optional[int],
+        selected_indices: Optional[List[int]] = None,
+    ) -> bool:
+        if max_running_tokens is None:
+            return True
+
+        if selected_indices is None:
+            return self.seq_lens_sum <= max_running_tokens
+
+        if len(selected_indices) == 0:
+            return True
+
+        return self.seq_lens_cpu[selected_indices].sum().item() <= max_running_tokens
+
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = self.reqs
         for idx in range(len(self.reqs)):
@@ -1906,7 +1922,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return retracted_reqs
 
     def retract_decode(
-        self, server_args: ServerArgs
+        self,
+        server_args: ServerArgs,
+        max_running_tokens: Optional[int] = None,
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))
@@ -1929,6 +1947,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
+            or not self.check_decode_running_tokens(
+                max_running_tokens, selected_indices=sorted_indices
+            )
         ):
             if len(sorted_indices) == 1:
                 # Always keep at least one request
@@ -1942,22 +1963,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.release_req(idx, len(sorted_indices), server_args)
 
         reqs_to_abort: List[Req] = []
-        if len(sorted_indices) <= 1 and not self.check_decode_mem(
-            selected_indices=sorted_indices
+        if len(sorted_indices) <= 1 and (
+            not self.check_decode_mem(selected_indices=sorted_indices)
+            or not self.check_decode_running_tokens(
+                max_running_tokens, selected_indices=sorted_indices
+            )
         ):
             # Even the last remaining request cannot fit in memory.
             # Instead of crashing the scheduler, gracefully abort it.
             last_idx = sorted_indices.pop()
             last_req = self.reqs[last_idx]
             last_req.to_finish = FINISH_ABORT(
-                "Out of memory even after retracting all other requests "
+                "Decode budget exceeded even after retracting all other requests "
                 "in the decode batch. Aborting the last request.",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             reqs_to_abort.append(last_req)
             self.release_req(last_idx, 0, server_args)
             logger.warning(
-                "retract_decode: aborted last request %s due to OOM", last_req.rid
+                "retract_decode: aborted last request %s due to decode budget overflow",
+                last_req.rid,
             )
 
         self.filter_batch(keep_indices=sorted_indices)

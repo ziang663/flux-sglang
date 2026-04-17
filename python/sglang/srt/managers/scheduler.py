@@ -637,6 +637,7 @@ class Scheduler(
             self.max_total_num_tokens,
             self.max_prefill_tokens,
             self.max_running_requests,
+            self.max_running_tokens,
             self.max_queued_requests,
             self.max_req_len,
             self.max_req_input_len,
@@ -2328,6 +2329,7 @@ class Scheduler(
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=self.max_prefill_bs,
             max_running_requests=self.max_running_requests,
+            max_running_tokens=self.max_running_tokens,
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
@@ -2499,14 +2501,23 @@ class Scheduler(
         if self.enable_hierarchical_cache:
             self.tree_cache.flush_write_through_acks()
 
-        # Check if decode out of memory
-        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+        activation_budget_retract_flag = (
+            self.max_running_tokens is not None
+            and not batch.check_decode_running_tokens(self.max_running_tokens)
+        )
+
+        # Check if decode out of memory or activation running-token budget overflow
+        if (
+            (kv_full_retract_flag := not batch.check_decode_mem())
+            or activation_budget_retract_flag
+        ) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
+                self.server_args,
+                max_running_tokens=self.max_running_tokens,
             )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
@@ -2536,6 +2547,8 @@ class Scheduler(
             msg_prefix = (
                 "KV cache pool is full. Retract requests. "
                 if kv_full_retract_flag
+                else "Activation running-token budget is full. Retract requests. "
+                if activation_budget_retract_flag
                 else "Testing retraction. "
             )
             msg_details = f"#retracted_reqs: {len(retracted_reqs)}, #new_tokens_gained: {new_token_gained}"

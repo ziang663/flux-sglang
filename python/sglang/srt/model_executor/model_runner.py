@@ -400,6 +400,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Get available memory before model loading
         pre_model_load_memory = self.init_torch_distributed()
+        self.total_gpu_memory = pre_model_load_memory
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()

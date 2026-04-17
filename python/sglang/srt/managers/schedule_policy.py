@@ -386,6 +386,7 @@ class PrefillAdder:
         priority_scheduling_preemption_threshold: int = 0,
         max_prefill_bs: int = 0,
         max_running_requests: Optional[int] = None,
+        max_running_tokens: Optional[int] = None,
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
@@ -433,10 +434,17 @@ class PrefillAdder:
         )
         self.nsa_prefill_cp_in_seq_split = is_nsa_prefill_cp_in_seq_split()
         self.max_running_requests = max_running_requests
+        self.max_running_tokens = max_running_tokens
         self.prefill_context_parallel_enabled = is_prefill_context_parallel_enabled()
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
+        self.current_running_tokens = 0
+        self.pending_running_tokens = 0
+        if running_batch is not None:
+            self.current_running_tokens = sum(
+                self._get_running_request_tokens(r) for r in running_batch.reqs
+            )
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -452,6 +460,21 @@ class PrefillAdder:
             )
             * self.new_token_ratio
         )
+
+    def _get_running_request_tokens(self, req: Req) -> int:
+        return len(req.origin_input_ids) + len(req.output_ids)
+
+    def _can_fit_running_tokens(self, req: Req) -> bool:
+        if self.max_running_tokens is None:
+            return True
+        req_tokens = len(req.fill_ids)
+        return (
+            self.current_running_tokens + self.pending_running_tokens + req_tokens
+            <= self.max_running_tokens
+        )
+
+    def _reserve_running_tokens(self, req: Req):
+        self.pending_running_tokens += len(req.fill_ids)
 
     @property
     def rem_total_tokens(self):
@@ -559,9 +582,14 @@ class PrefillAdder:
         req.extend_input_len = trunc_len
         req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
 
+        if not self._can_fit_running_tokens(req):
+            return AddReqResult.OTHER
+
         self.can_run_list.append(req)
+        self._reserve_running_tokens(req)
 
         self._update_prefill_budget(prefix_len, trunc_len, 0)
+        return AddReqResult.CONTINUE
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
@@ -579,7 +607,10 @@ class PrefillAdder:
         truncated = req.extend_input_len > _rem_tokens
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+        if not self._can_fit_running_tokens(req):
+            return AddReqResult.OTHER
         self.can_run_list.append(req)
+        self._reserve_running_tokens(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
         max_new_tokens = (
@@ -609,7 +640,10 @@ class PrefillAdder:
         truncated = req.extend_input_len > _rem_tokens
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+        if not self._can_fit_running_tokens(req):
+            return req if truncated else None
         self.can_run_list.append(req)
+        self._reserve_running_tokens(req)
         self._update_prefill_budget(
             0,
             req.extend_input_len,
@@ -698,13 +732,18 @@ class PrefillAdder:
             if self.rem_dllm_tokens <= 0:
                 return AddReqResult.OTHER
 
-            self._add_dllm_req(req, 0)
+            res = self._add_dllm_req(req, 0)
+            if res != AddReqResult.CONTINUE:
+                return res
         elif (
             self.rem_chunk_tokens is None  # chunked prefill is disabled
             or req.extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
         ):
             # Non-chunked prefill
+            if not self._can_fit_running_tokens(req):
+                return AddReqResult.OTHER
             self.can_run_list.append(req)
+            self._reserve_running_tokens(req)
             self._update_prefill_budget(
                 0,
                 req.extend_input_len,
@@ -719,7 +758,10 @@ class PrefillAdder:
 
             req.set_extend_input_len(trunc_len)
             req.fill_ids = req.fill_ids[:trunc_len]
+            if not self._can_fit_running_tokens(req):
+                return AddReqResult.OTHER
             self.can_run_list.append(req)
+            self._reserve_running_tokens(req)
             self.new_chunked_req = req
             self._update_prefill_budget(0, trunc_len, 0)
 
@@ -798,11 +840,16 @@ class PrefillAdder:
                     truncation_align_size is None
                 ), "truncation_align_size is not supported for dllm prefill"
 
-                self._add_dllm_req(req, prefix_len)
+                res = self._add_dllm_req(req, prefix_len)
+                if res != AddReqResult.CONTINUE:
+                    return res
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
+                if not self._can_fit_running_tokens(req):
+                    return AddReqResult.OTHER
                 self.can_run_list.append(req)
+                self._reserve_running_tokens(req)
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
@@ -835,7 +882,10 @@ class PrefillAdder:
                 req.set_extend_input_len(trunc_len)
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
+                if not self._can_fit_running_tokens(req):
+                    return AddReqResult.OTHER
                 self.can_run_list.append(req)
+                self._reserve_running_tokens(req)
                 self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
