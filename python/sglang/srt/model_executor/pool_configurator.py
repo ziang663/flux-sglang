@@ -26,7 +26,10 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    get_compress_state_ring_size,
+    use_speculative_compress_state_layout,
+)
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 from sglang.srt.utils.common import is_float4_e2m1fn_x2
 
@@ -322,7 +325,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.compression_ratios = cfg.compress_ratios
         self.swa_page_size = cfg.window_size
         self.swa_ratio = mr.server_args.swa_full_tokens_ratio
-        self.is_speculative = mr.server_args.speculative_algorithm is not None
+        self.has_speculative_worker = mr.server_args.speculative_algorithm is not None
+        self.use_speculative_state_layout = use_speculative_compress_state_layout(
+            mr.server_args
+        )
         if mr.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -335,15 +341,19 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self.c4_shrink_factor > 1:
             logger.info(f"HiSparse c4 host-to-device ratio = {self.c4_shrink_factor}")
 
-        self.c4_ring_size = get_compress_state_ring_size(4, self.is_speculative)
-        self.c128_ring_size = get_compress_state_ring_size(128, self.is_speculative)
+        self.c4_ring_size = get_compress_state_ring_size(
+            4, self.use_speculative_state_layout
+        )
+        self.c128_ring_size = get_compress_state_ring_size(
+            128, self.use_speculative_state_layout
+        )
 
         self.num_layers_total = len(self.compression_ratios)
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
 
         self.bytes_per_full_token = self._get_bytes_per_full_token()
-        if self.is_speculative:
+        if self.has_speculative_worker:
             # Reserve memory for the speculative draft worker by inflating
             # per-token bytes by (target+draft)/target. Equivalent to dflash's
             # scale_kv_cell_size_per_token_for_dflash but applied to
